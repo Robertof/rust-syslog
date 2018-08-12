@@ -44,6 +44,7 @@ use std::io::{self, BufWriter, Write};
 use std::sync::{Arc,Mutex};
 use std::marker::PhantomData;
 use std::net::{SocketAddr,ToSocketAddrs,UdpSocket,TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::{UnixDatagram, UnixStream};
 
 use libc::getpid;
@@ -104,8 +105,14 @@ impl<W:Write, T, F:LogFormat<T>> Logger<W, T, F> {
 
 pub enum LoggerBackend {
   /// Unix socket, temp file path, log file path
+  #[cfg(unix)]
   Unix(UnixDatagram),
+  #[cfg(not(unix))]
+  Unix(()),
+  #[cfg(unix)]
   UnixStream(BufWriter<UnixStream>),
+  #[cfg(not(unix))]
+  UnixStream(()),
   Udp(UdpSocket, SocketAddr),
   Tcp(BufWriter<TcpStream>)
 }
@@ -114,9 +121,11 @@ impl Write for LoggerBackend {
   /// Sends a message directly, without any formatting
   fn write(&mut self, message: &[u8]) -> io::Result<usize> {
     match self {
+      #[cfg(unix)]
       &mut LoggerBackend::Unix(ref dgram) => {
         dgram.send(&message[..])
       },
+      #[cfg(unix)]
       &mut LoggerBackend::UnixStream(ref mut socket) => {
         let null = [0 ; 1];
         socket.write(&message[..]).and_then(|sz| {
@@ -128,16 +137,21 @@ impl Write for LoggerBackend {
       },
       &mut LoggerBackend::Tcp(ref mut socket)         => {
         socket.write(&message[..])
-      }
+      },
+      #[cfg(not(unix))]
+      &mut LoggerBackend::Unix(_) | &mut LoggerBackend::UnixStream(_)
+        => Err(io::Error::new(io::ErrorKind::Other, "unsupported platform"))
     }
   }
 
   fn write_fmt(&mut self, args: Arguments) -> io::Result<()>  {
     match self {
+      #[cfg(unix)]
       &mut LoggerBackend::Unix(ref dgram) => {
         let message = fmt::format(args);
         dgram.send(message.as_bytes()).map(|_| ())
       },
+      #[cfg(unix)]
       &mut LoggerBackend::UnixStream(ref mut socket) => {
         let null = [0 ; 1];
         socket.write_fmt(args).and_then(|_| {
@@ -150,15 +164,20 @@ impl Write for LoggerBackend {
       },
       &mut LoggerBackend::Tcp(ref mut socket)         => {
         socket.write_fmt(args)
-      }
+      },
+      #[cfg(not(unix))]
+      &mut LoggerBackend::Unix(_) | &mut LoggerBackend::UnixStream(_)
+        => Err(io::Error::new(io::ErrorKind::Other, "unsupported platform"))
     }
   }
 
   fn flush(&mut self) -> io::Result<()> {
     match self {
+      #[cfg(unix)]
       &mut LoggerBackend::Unix(_) => {
         Ok(())
       },
+      #[cfg(unix)]
       &mut LoggerBackend::UnixStream(ref mut socket) => {
         socket.flush()
       },
@@ -167,12 +186,16 @@ impl Write for LoggerBackend {
       },
       &mut LoggerBackend::Tcp(ref mut socket)        => {
         socket.flush()
-      }
+      },
+      #[cfg(not(unix))]
+      &mut LoggerBackend::Unix(_) | &mut LoggerBackend::UnixStream(_)
+        => Err(io::Error::new(io::ErrorKind::Other, "unsupported platform"))
     }
   }
 }
 
 /// Returns a Logger using unix socket to target local syslog ( using /dev/log or /var/run/syslog)
+#[cfg(unix)]
 pub fn unix<U: Display, F: Clone+LogFormat<U>>(formatter: F) -> Result<Logger<LoggerBackend, U, F>> {
     unix_connect(formatter.clone(), "/dev/log").or_else(|e| {
       if let &ErrorKind::Io(ref io_err) = e.kind() {
@@ -184,11 +207,23 @@ pub fn unix<U: Display, F: Clone+LogFormat<U>>(formatter: F) -> Result<Logger<Lo
     }).chain_err(|| ErrorKind::Initialization)
 }
 
+#[cfg(not(unix))]
+pub fn unix<U: Display, F: Clone+LogFormat<U>>(_formatter: F) -> Result<Logger<LoggerBackend, U, F>> {
+  Err(ErrorKind::UnsupportedPlatform)?
+}
+
 /// Returns a Logger using unix socket to target local syslog at user provided path
+#[cfg(unix)]
 pub fn unix_custom<P: AsRef<Path>, U: Display, F: LogFormat<U>>(formatter: F, path: P) -> Result<Logger<LoggerBackend, U, F>> {
   unix_connect(formatter, path).chain_err(|| ErrorKind::Initialization)
 }
 
+#[cfg(not(unix))]
+pub fn unix_custom<P: AsRef<Path>, U: Display, F: LogFormat<U>>(_formatter: F, _path: P) -> Result<Logger<LoggerBackend, U, F>> {
+  Err(ErrorKind::UnsupportedPlatform)?
+}
+
+#[cfg(unix)]
 fn unix_connect<P: AsRef<Path>, U: Display, F: LogFormat<U>>(formatter: F, path: P) -> Result<Logger<LoggerBackend, U, F>> {
   let sock = UnixDatagram::unbound()?;
   match sock.connect(&path) {
@@ -274,6 +309,7 @@ impl Log for BasicLogger {
 }
 
 /// Unix socket Logger init function compatible with log crate
+#[cfg(unix)]
 pub fn init_unix(facility: Facility, log_level: log::LevelFilter) -> Result<()> {
   let (process_name, pid) = get_process_info()?;
   let formatter = Formatter3164 {
@@ -287,11 +323,17 @@ pub fn init_unix(facility: Facility, log_level: log::LevelFilter) -> Result<()> 
     ).chain_err(|| ErrorKind::Initialization)
   })?;
 
-    log::set_max_level(log_level);
-    Ok(())
+  log::set_max_level(log_level);
+  Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn init_unix(_facility: Facility, _log_level: log::LevelFilter) -> Result<()> {
+  Err(ErrorKind::UnsupportedPlatform)?
 }
 
 /// Unix socket Logger init function compatible with log crate and user provided socket path
+#[cfg(unix)]
 pub fn init_unix_custom<P: AsRef<Path>>(facility: Facility, log_level: log::LevelFilter, path: P) -> Result<()> {
   let (process_name, pid) = get_process_info()?;
   let formatter = Formatter3164 {
@@ -305,8 +347,13 @@ pub fn init_unix_custom<P: AsRef<Path>>(facility: Facility, log_level: log::Leve
     .chain_err(|| ErrorKind::Initialization)
   })?;
 
-    log::set_max_level(log_level);
-    Ok(())
+  log::set_max_level(log_level);
+  Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn init_unix_custom<P: AsRef<Path>>(_facility: Facility, _log_level: log::LevelFilter, _path: P) -> Result<()> {
+  Err(ErrorKind::UnsupportedPlatform)?
 }
 
 /// UDP Logger init function compatible with log crate
